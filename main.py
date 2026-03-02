@@ -92,8 +92,6 @@ def main() -> None:
                         selected   = None
                     elif not game_over:
                         paused = not paused
-                        if not paused:
-                            selected = None
 
                 elif k in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
                     spd_idx = min(spd_idx + 1, len(SPEED_LEVELS) - 1)
@@ -150,6 +148,9 @@ def main() -> None:
             sub_dt = dt / speedup
             for _ in range(speedup):
                 sim.update(sub_dt)
+            # Clear selection if the tracked entity died this tick
+            if selected is not None and not selected.alive:
+                selected = None
 
         # Render
         if game_over:

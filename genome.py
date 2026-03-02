@@ -13,7 +13,7 @@ from config import (
 )
 
 # ── Gene indices ──────────────────────────────────────────────────────────────
-GENE_COUNT   = 12
+GENE_COUNT   = 13
 G_SIZE       = 0
 G_SPEED      = 1
 G_VIS_RANGE  = 2
@@ -25,7 +25,8 @@ G_OFFSPRING  = 7
 G_GESTATION  = 8
 G_MUTABILI   = 9
 G_HUE        = 10  # family colour identity; drifts with mutation
-G_SOCIALITY  = 11  # 0 = loner, 1 = highly social (flocks, protects kin)
+G_SOCIALITY  = 11  # 0 = loner, 1 = highly social (flocks with kin, pack bonuses)
+G_KIN_PROT   = 12  # 0 = no kin recognition, 1 = never attacks genetic kin
 
 
 class Genome:
@@ -42,7 +43,7 @@ class Genome:
         # cached phenotypes ──────────────────────────────────────────────────
         "_size", "_speed_raw", "_max_speed",
         "_vision_range", "_vision_half_angle",
-        "_diet", "_aggression", "_sociality",
+        "_diet", "_aggression", "_sociality", "_kin_protection",
         "_reproduce_threshold", "_offspring_count",
         "_gestation", "_mutability", "_hue",
         "_radius", "_max_hp",
@@ -75,6 +76,7 @@ class Genome:
         self._diet         = float(g[G_DIET])
         self._aggression   = float(g[G_AGGRESS])
         self._sociality    = float(g[G_SOCIALITY])
+        self._kin_protection = float(g[G_KIN_PROT])
         self._reproduce_threshold = (REPR_THRESH_MIN
                                      + g[G_REPR_THR] * (REPR_THRESH_MAX - REPR_THRESH_MIN))
         self._offspring_count = max(1, round(
@@ -136,8 +138,13 @@ class Genome:
 
     @property
     def sociality(self) -> float:
-        """0 = complete loner, 1 = highly social (flocks with kin, won't attack kin)."""
+        """0 = complete loner, 1 = highly social (flocks with kin, pack bonuses)."""
         return self._sociality
+
+    @property
+    def kin_protection(self) -> float:
+        """0 = indifferent to kin, 1 = never attacks genetic kin (including own offspring)."""
+        return self._kin_protection
 
     # ── Reproduction ──────────────────────────────────────────────────────────
 

@@ -10,6 +10,7 @@ from config import (
     INITIAL_POPULATION, MIN_POPULATION,
     STATS_TICK, POP_HISTORY_LEN,
     MIN_AGGRESSION_TO_ATTACK,
+    HERB_LOW_THRESHOLD, FOOD_SPAWN_HERB_BONUS,
 )
 
 
@@ -122,8 +123,10 @@ class Simulation:
     def update(self, dt: float) -> None:
         self.time += dt
 
-        # 1. Spawn food
-        self._food_acc += FOOD_SPAWN_RATE * dt
+        # 1. Spawn food (boosted when herbivores are scarce to help recovery)
+        herb_count  = self.herbivore_count
+        spawn_bonus = FOOD_SPAWN_HERB_BONUS * max(0.0, 1.0 - herb_count / HERB_LOW_THRESHOLD)
+        self._food_acc += FOOD_SPAWN_RATE * (1.0 + spawn_bonus) * dt
         while self._food_acc >= 1.0 and len(self.food) < MAX_FOOD:
             self._place_food()
             self._food_acc -= 1.0
@@ -166,7 +169,7 @@ class Simulation:
                           self.width, self.height, dt)
 
             if not entity.alive:
-                new_corpses.append(Corpse(entity.x, entity.y, entity.genome.size, entity.energy))
+                new_corpses.append(Corpse(entity.x, entity.y, entity.genome.size * entity._growth, entity.energy))
                 continue
 
             # b. Eat plants (skip pure carnivores that can't digest plants)
@@ -185,7 +188,7 @@ class Simulation:
             if entity.genome.aggression >= MIN_AGGRESSION_TO_ATTACK and entity._atk_cd <= 0:
                 attack_targets = [e for e in nearby_ents if e.id != entity.id and e.alive]
                 for dead in entity.attack(attack_targets, nearby_ents):
-                    new_corpses.append(Corpse(dead.x, dead.y, dead.genome.size, dead.energy))
+                    new_corpses.append(Corpse(dead.x, dead.y, dead.genome.size * dead._growth, dead.energy))
 
             # e. Start gestation if energy is sufficient
             entity.reproduce()

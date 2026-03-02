@@ -40,8 +40,8 @@ class Corpse:
         return max(0.0, 1.0 - self.age / CORPSE_DECAY)
 
     def bite(self, amount: float = CORPSE_BITE) -> float:
-        """Extract up to *amount* energy.  Returns actual energy extracted."""
-        taken = min(self.energy, amount)
+        """Extract up to *amount* energy, scaled by freshness.  Returns actual energy extracted."""
+        taken = min(self.energy, amount * self.freshness)
         self.energy -= taken
         return taken
 

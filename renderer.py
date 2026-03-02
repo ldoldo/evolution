@@ -54,7 +54,7 @@ class Renderer:
         self._draw_world(sim, selected)
         if replay_idx is not None:
             self._draw_replay_panel(sim, replay_idx, total_snaps)
-        elif paused and selected is not None:
+        elif selected is not None:
             self._draw_entity_inspector(selected, sim.time)
         else:
             self._draw_panel(sim, speedup, paused, hint=paused)
@@ -370,6 +370,7 @@ class Renderer:
             ("Mutabil.",  g.genes[9],  f"{g.mutability:.4f}"),
             ("Hue",       g.genes[10], f"{g.hue:.3f}"),
             ("Sociality", g.genes[11], f"{g.sociality:.3f}"),
+            ("Kin prot.", g.genes[12], f"{g.kin_protection:.3f}"),
         ]
 
         for label, raw, value_str in genes:

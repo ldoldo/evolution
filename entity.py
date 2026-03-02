@@ -9,13 +9,15 @@ _TWO_PI = math.pi * 2
 from genome import Genome
 from food import Food, Corpse
 from config import (
-    BASE_METABOLISM, SIZE_COST, MOVE_COST,
+    BASE_METABOLISM, SIZE_COST, MOVE_COST, DIET_METABOLISM_EXTRA,
     ATTACK_RANGE_EXTRA, ATTACK_COOLDOWN,
     MIN_AGGRESSION_TO_ATTACK, ATTACK_ENERGY_COST,
     SPAWN_SCATTER, MIN_PARENT_ENERGY_FRAC, BIRTH_COOLDOWN,
     KIN_THRESHOLD, FLOCK_IDEAL_DIST,
     GESTATION_DURATION, BIRTH_GROWTH, GROWTH_RATE,
     PACK_BONUS_PER_KIN, PACK_BONUS_RANGE, MAX_PACK_BONUS,
+    PACK_FLEE_PER_KIN, PACK_DEFENSE_PER_KIN, HERD_RETALIATION_PER_KIN,
+    HP_REGEN_RATE,
 )
 
 
@@ -99,10 +101,12 @@ class Entity:
     # ── Metabolism ────────────────────────────────────────────────────────────
 
     def _metabolic_cost(self, dt: float) -> float:
-        spd   = math.hypot(self.vx, self.vy)
-        g     = self.genome
-        norm  = spd / max(g.max_speed, 1.0)
-        cost  = BASE_METABOLISM + g.size ** 2 * SIZE_COST + norm * g.size * MOVE_COST
+        spd      = math.hypot(self.vx, self.vy)
+        g        = self.genome
+        eff_size = g.size * self._growth
+        norm     = spd / max(g.max_speed, 1.0)
+        cost     = (BASE_METABOLISM + g.diet * DIET_METABOLISM_EXTRA
+                    + eff_size ** 2 * SIZE_COST + norm * eff_size * MOVE_COST)
         return cost * dt
 
     # ── Field of view ─────────────────────────────────────────────────────────
@@ -192,8 +196,10 @@ class Entity:
 
         # Kin dict pre-computed once in update() and cached on self._kin_cache
         kin = self._kin_cache
+        # Count visible kin for pack-flee bonus (0 when cache empty / loner)
+        kin_count = sum(1 for v in kin.values() if v)
 
-        self_size = g.size   # accessed twice per iteration below
+        self_size = g.size * self._growth   # effective body size (shrinks while juvenile)
         vis_half  = self._cached_vis_half          # cache outside loop
         limited_fov = vis_half < math.pi and self._cached_spd >= 1.0
 
@@ -220,7 +226,7 @@ class Entity:
 
             # Am I a meaningful predator to this entity?  (needed before avoid)
             other_diet = other.genome.diet
-            other_size = other.genome.size
+            other_size = other.genome.size * other._growth
             diet_advantage = diet - other_diet
             size_advantage = self_size / max(other_size, 0.01)
             is_hunter = diet_advantage > 0.15 and size_advantage >= 0.6
@@ -248,13 +254,14 @@ class Entity:
                 dy -= oy * w
 
             if is_hunter and aggress > 0.25:
-                # Social entities don't chase kin
-                if not (is_kin and soc > 0.3):
+                # Kin-protective entities don't chase kin
+                if not (is_kin and g.kin_protection > 0.3):
                     chase_w = meat_w * aggress * hunger * 2.0 / (dist + 1.0)
                     dx += ox * chase_w
                     dy += oy * chase_w
             elif is_threat:
-                flee_w = (1.0 - aggress) * 3.5 / (dist + 1.0)
+                pack_flee = 1.0 + PACK_FLEE_PER_KIN * min(kin_count, MAX_PACK_BONUS)
+                flee_w = (1.0 - aggress) * 3.5 * pack_flee / (dist + 1.0)
                 dx -= ox * flee_w
                 dy -= oy * flee_w
 
@@ -295,6 +302,11 @@ class Entity:
         if self._gestation_timer > 0:
             self._gestation_timer = max(0.0, self._gestation_timer - dt)
 
+        # ── Passive HP regen ──────────────────────────────────────────────────
+        max_hp = self.effective_max_hp
+        if self.hp < max_hp:
+            self.hp = min(self.hp + max_hp * HP_REGEN_RATE * dt, max_hp)
+
         # ── FOV geometry cache ────────────────────────────────────────────────
         # Refreshed here so _in_fov() never recomputes these per-call.
         self._cached_spd     = math.hypot(self.vx, self.vy)
@@ -306,7 +318,7 @@ class Entity:
         # Computed once per tick; read by _compute_desired() and attack() so
         # the numpy array construction and mean() run only once per entity.
         self._kin_cache = {}
-        if entities and self.genome.sociality > 0.05:
+        if entities and (self.genome.sociality > 0.05 or self.genome.kin_protection > 0.05):
             sg  = self.genome.genes
             og  = np.array([e.genome.genes for e in entities])   # (n, 12)
             sim = 1.0 - np.abs(sg - og).mean(axis=1)             # (n,)
@@ -416,10 +428,11 @@ class Entity:
         if g.aggression < MIN_AGGRESSION_TO_ATTACK:
             return []
 
-        need_kin = g.sociality > 0.3
+        skip_kin  = g.kin_protection > 0.3   # won't attack genetic kin
+        is_social = g.sociality > 0.3        # coordinates pack hunts
 
         # Kin dict pre-computed in update() this tick — no numpy rebuild needed
-        kin = self._kin_cache if need_kin else {}
+        kin = self._kin_cache
 
         reach = self.effective_radius + ATTACK_RANGE_EXTRA
         dmg   = g.attack_damage
@@ -430,8 +443,8 @@ class Entity:
         for other in candidates:
             if not other.alive or other.id == self.id:
                 continue
-            # Kin protection: social entities won't attack their own kind
-            if need_kin and kin.get(other.id, False):
+            # Kin protection: entities with high kin_protection won't attack kin
+            if skip_kin and kin.get(other.id, False):
                 continue
             dist = math.hypot(other.x - self.x, other.y - self.y)
             if dist < reach + other.effective_radius and dist < best_dist:
@@ -439,9 +452,9 @@ class Entity:
                 best = other
 
         if best is not None:
-            # Pack bonus: count kin supporters within PACK_BONUS_RANGE
+            # Pack bonus: social entities coordinate their attacks
             pack_mult = 1.0
-            if nearby is not None and need_kin:
+            if nearby is not None and is_social:
                 kin_support = sum(
                     1 for e in nearby
                     if (e.id != self.id and e.alive
@@ -450,8 +463,22 @@ class Entity:
                 )
                 pack_mult = 1.0 + PACK_BONUS_PER_KIN * min(kin_support, MAX_PACK_BONUS)
 
-            best.hp      -= dmg * pack_mult                    # combat damages health
-            self.hp      -= best.genome.attack_damage * 0.25   # defender retaliates (health)
+            # Herd defense + retaliation: kin near the target reduce damage and bite back
+            herd_def   = 1.0
+            herd_retal = 1.0
+            if best._kin_cache:
+                kin_near = sum(
+                    1 for e in (nearby or [])
+                    if e.id != best.id and e.alive
+                    and math.hypot(e.x - best.x, e.y - best.y) <= PACK_BONUS_RANGE
+                    and best._kin_cache.get(e.id, False)
+                )
+                capped = min(kin_near, MAX_PACK_BONUS)
+                herd_def   = 1.0 - PACK_DEFENSE_PER_KIN      * capped
+                herd_retal = 1.0 + HERD_RETALIATION_PER_KIN  * capped
+
+            best.hp  -= dmg * pack_mult * self._growth * herd_def           # incoming hit
+            self.hp  -= best.genome.attack_damage * best._growth * 0.25 * herd_retal  # retaliation
             self.energy  -= ATTACK_ENERGY_COST                 # stamina cost (energy)
             self._atk_cd  = ATTACK_COOLDOWN
             if best.hp <= 0:
