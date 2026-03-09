@@ -2,14 +2,13 @@ import numpy as np
 
 from entity import Entity
 from food import Food, Corpse
-from genome import Genome
+from genome import Genome, GENE_COUNT, G_DIET
 from config import (
     WORLD_WIDTH, WORLD_HEIGHT,
     FOOD_SPAWN_RATE, MAX_FOOD,
     FOOD_CLUSTER_CHANCE, FOOD_CLUSTER_SIGMA,
     INITIAL_POPULATION, MIN_POPULATION,
     STATS_TICK, POP_HISTORY_LEN,
-    MIN_AGGRESSION_TO_ATTACK,
     HERB_LOW_THRESHOLD, FOOD_SPAWN_HERB_BONUS,
 )
 
@@ -32,7 +31,8 @@ class Simulation:
     5. Respawn if population critically low
     """
 
-    def __init__(self, width: int = WORLD_WIDTH, height: int = WORLD_HEIGHT) -> None:
+    def __init__(self, width: int = WORLD_WIDTH, height: int = WORLD_HEIGHT,
+                 seed_genomes=None) -> None:
         self.width    = width
         self.height   = height
         self.entities: list[Entity]  = []
@@ -66,14 +66,43 @@ class Simulation:
         self._prev_herb = -1   # -1 = not yet sampled; skip first extinction check
         self._prev_carn = -1
 
+        # Extinction recovery: remember recently-dead genomes so they can seed the next run
+        self._seed_genomes:      list = seed_genomes or []
+        self._last_herb_genomes: list = []   # up to 30 recently-dead herbivore genomes
+        self._last_carn_genomes: list = []   # up to 30 recently-dead carnivore genomes
+
         self._init_population()
         self._seed_food(MAX_FOOD // 2)
         self._log(f"Simulation started ({INITIAL_POPULATION} founders)")
 
     # ── Initialisation ────────────────────────────────────────────────────────
 
+    @staticmethod
+    def random_typed_genome(diet_lo: float, diet_hi: float, source=None) -> Genome:
+        """Genome with diet gene forced into [diet_lo, diet_hi].
+
+        If *source* is supplied its body genes and NN weights are reused
+        (only diet is overridden), giving the injected entity a proven brain
+        rather than a useless random one.
+        """
+        if source is not None:
+            genes = source.genes.copy()
+            genes[G_DIET] = np.random.uniform(diet_lo, diet_hi)
+            return Genome(genes=genes,
+                          w1=source.w1.copy(), b1=source.b1.copy(),
+                          w2=source.w2.copy(), b2=source.b2.copy())
+        genes = np.random.uniform(0.0, 1.0, GENE_COUNT)
+        genes[G_DIET] = np.random.uniform(diet_lo, diet_hi)
+        return Genome(genes=genes)
+
     def _init_population(self) -> None:
-        for _ in range(INITIAL_POPULATION):
+        # Seed from provided genomes (each mutated once for diversity)
+        for genome in self._seed_genomes[:INITIAL_POPULATION]:
+            x = np.random.uniform(0, self.width)
+            y = np.random.uniform(0, self.height)
+            self.entities.append(Entity(x, y, genome=genome.mutate()))
+        # Fill remainder with fresh random entities
+        for _ in range(INITIAL_POPULATION - len(self.entities)):
             x = np.random.uniform(0, self.width)
             y = np.random.uniform(0, self.height)
             self.entities.append(Entity(x, y))
@@ -184,8 +213,10 @@ class Simulation:
                 for c in entity.eat_corpse(available_corps):
                     eaten_corps.add(id(c))
 
-            # d. Attack (skip non-aggressors and entities still on cooldown)
-            if entity.genome.aggression >= MIN_AGGRESSION_TO_ATTACK and entity._atk_cd <= 0:
+            # d. Attack (gated on NN attack signal and cooldown)
+            # Threshold 0.3 requires a clear attack intention — filters out
+            # omnivores with a marginal signal and entities nowhere near prey.
+            if entity._nn_attack >= 0.3 and entity._atk_cd <= 0:
                 attack_targets = [e for e in nearby_ents if e.id != entity.id and e.alive]
                 for dead in entity.attack(attack_targets, nearby_ents):
                     new_corpses.append(Corpse(dead.x, dead.y, dead.genome.size * dead._growth, dead.energy))
@@ -210,6 +241,17 @@ class Simulation:
                 pass   # already handled above
 
         self.entities = [e for e in ent_snap if e.alive]
+
+        # Save recently-dead genomes for extinction recovery
+        for entity in ent_snap:
+            if not entity.alive:
+                d = entity.genome.diet
+                if d < 0.35:
+                    self._last_herb_genomes.append(entity.genome)
+                elif d > 0.65:
+                    self._last_carn_genomes.append(entity.genome)
+        self._last_herb_genomes = self._last_herb_genomes[-30:]
+        self._last_carn_genomes = self._last_carn_genomes[-30:]
 
         # 4. Remove eaten food
         self.food = [f for f in food_snap if id(f) not in eaten_food]

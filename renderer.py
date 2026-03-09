@@ -49,6 +49,7 @@ class Renderer:
         selected=None,              # Entity | None
         replay_idx=None,            # int | None — current snapshot index
         total_snaps: int = 0,
+        extinction_count: int = 0,
     ) -> None:
         self.screen.fill(BG_COLOR)
         self._draw_world(sim, selected)
@@ -57,7 +58,8 @@ class Renderer:
         elif selected is not None:
             self._draw_entity_inspector(selected, sim.time)
         else:
-            self._draw_panel(sim, speedup, paused, hint=paused)
+            self._draw_panel(sim, speedup, paused, hint=paused,
+                             extinction_count=extinction_count)
         self._draw_graph(sim)
 
     def toggle_debug(self) -> None:
@@ -159,7 +161,8 @@ class Renderer:
 
     # ── Side panel ────────────────────────────────────────────────────────────
 
-    def _draw_panel(self, sim: Simulation, speedup: int, paused: bool, hint: bool = False) -> None:
+    def _draw_panel(self, sim: Simulation, speedup: int, paused: bool, hint: bool = False,
+                    extinction_count: int = 0) -> None:
         px = WORLD_WIDTH + 1
         panel_rect = pygame.Rect(px, 0, PANEL_WIDTH, HEIGHT)
         pygame.draw.rect(self.screen, _PANEL_BG, panel_rect)
@@ -179,6 +182,8 @@ class Renderer:
 
         # Title
         y = txt("EVOLUTION SIM", x, y, _WHITE)
+        if extinction_count > 0:
+            y = txt(f"Restarts  {extinction_count:>8d}", x, y, _ORANGE)
         y = sep(y + 2)
 
         # Time / gen

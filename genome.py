@@ -10,6 +10,7 @@ from config import (
     REPR_THRESH_MIN, REPR_THRESH_MAX, OFFSPRING_MIN, OFFSPRING_MAX,
     GESTATION_MIN, GESTATION_MAX, MUTABILITY_MIN, MUTABILITY_MAX,
     BASE_SPEED_PX, ENTITY_RADIUS_MULT, BASE_ATTACK_DMG, HP_PER_SIZE,
+    NN_INPUT, NN_HIDDEN, NN_OUTPUT,
 )
 
 # ── Gene indices ──────────────────────────────────────────────────────────────
@@ -49,16 +50,88 @@ class Genome:
         "_radius", "_max_hp",
         "_plant_efficiency", "_meat_efficiency", "_attack_damage",
         "_color",
+        # neural-network brain ───────────────────────────────────────────────
+        "w1", "b1",   # input→hidden  shapes (NN_HIDDEN, NN_INPUT) and (NN_HIDDEN,)
+        "w2", "b2",   # hidden→output shapes (NN_OUTPUT, NN_HIDDEN) and (NN_OUTPUT,)
     )
 
-    def __init__(self, genes: np.ndarray | None = None) -> None:
+    def __init__(
+        self,
+        genes: np.ndarray | None = None,
+        w1: np.ndarray | None = None,
+        b1: np.ndarray | None = None,
+        w2: np.ndarray | None = None,
+        b2: np.ndarray | None = None,
+    ) -> None:
         if genes is None:
             self.genes: np.ndarray = np.random.uniform(0.0, 1.0, GENE_COUNT)
         else:
             self.genes = np.asarray(genes, dtype=np.float64)
+
+        # NN weights — warm-start from designed defaults + diversity noise
+        if w1 is None:
+            dw1, db1, dw2, db2 = Genome._default_weights()
+            noise = 0.10   # σ=0.30 drowns the warm-start signal; 0.10 keeps designed behaviour intact
+            self.w1 = dw1 + np.random.normal(0.0, noise, dw1.shape)
+            self.b1 = db1 + np.random.normal(0.0, noise, db1.shape)
+            self.w2 = dw2 + np.random.normal(0.0, noise, dw2.shape)
+            self.b2 = db2 + np.random.normal(0.0, noise, db2.shape)
+        else:
+            self.w1 = w1
+            self.b1 = b1
+            self.w2 = w2
+            self.b2 = b2
+
         self._compute_phenotypes()
 
     # ── Internal helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _default_weights():
+        """
+        Manually designed weight matrices encoding basic survival instincts.
+        Used as warm-start for generation-0 entities (Gaussian noise added on top).
+
+        Observation layout (18 inputs):
+          0  hunger      1  hp_frac    2  diet
+          3,4 food_cos/sin   5  food_dist
+          6,7 corpse_cos/sin 8  corpse_dist
+          9,10 threat_cos/sin 11 threat_dist
+          12,13 prey_cos/sin  14 prey_dist
+          15,16 kin_cos/sin   17 kin_dist
+
+        Hidden units (8):
+          h0 food cos · h1 food sin
+          h2 prey cos · h3 prey sin
+          h4 attack gate (prey dist × diet × hunger, biased off by default)
+          h5 −threat cos (flee x) · h6 −threat sin (flee y)
+          h7 corpse cos (scavenging)
+        """
+        w1 = np.zeros((NN_HIDDEN, NN_INPUT))
+        b1 = np.zeros(NN_HIDDEN)
+        w2 = np.zeros((NN_OUTPUT, NN_HIDDEN))
+        b2 = np.zeros(NN_OUTPUT)
+
+        # h0/h1: track nearest food direction
+        w1[0, 3] = 2.0;  w1[1, 4] = 2.0
+        # h2/h3: track nearest prey direction (stronger so carnivores commit to the chase)
+        w1[2, 12] = 3.0; w1[3, 13] = 3.0
+        # h4: attack gate — fires strongly when prey is close (prey_dist weight 2.5)
+        # so the gate is decisive at close range without needing prey to be literally adjacent.
+        w1[4, 14] = 2.5; w1[4, 2] = 2.0; w1[4, 0] = 1.5; b1[4] = -1.8
+        # h5/h6: flee direction (inverted threat → negative = move away)
+        w1[5, 9]  = -2.5; w1[6, 10] = -2.5
+        # h7: track nearest corpse — both cos AND sin so feeding works in all directions
+        w1[7, 6]  = 2.0;  w1[7, 7] = 2.0
+
+        # out[0] move_dx: food + prey (stronger) + flee + corpse
+        w2[0, 0] = 1.5; w2[0, 2] = 2.0; w2[0, 5] = 1.2; w2[0, 7] = 1.0
+        # out[1] move_dy: food + prey (stronger) + flee + corpse (was missing corpse y)
+        w2[1, 1] = 1.5; w2[1, 3] = 2.0; w2[1, 6] = 1.2; w2[1, 7] = 1.0
+        # out[2] attack: lower bias so a starving carnivore near prey reliably fires
+        w2[2, 4] = 3.0; b2[2] = -0.5
+
+        return w1, b1, w2, b2
 
     @staticmethod
     def _lerp(raw: float, lo: float, hi: float) -> float:
@@ -210,11 +283,30 @@ class Genome:
         """
         return self._color
 
+    # ── Brain ─────────────────────────────────────────────────────────────────
+
+    def forward(self, obs: np.ndarray) -> np.ndarray:
+        """
+        Single forward pass through the two-layer network.
+
+        obs  : shape (NN_INPUT,)  — normalised sensory + state inputs
+        returns shape (NN_OUTPUT,) — move_dx, move_dy, attack_signal in [-1, 1]
+        """
+        h = np.tanh(self.w1 @ obs + self.b1)
+        return np.tanh(self.w2 @ h + self.b2)
+
     # ── Mutation ──────────────────────────────────────────────────────────────
 
-    def mutate(self) -> "Genome":
-        """Return a child genome with Gaussian noise applied to each gene."""
+    def mutate(self, preserve_diet: bool = False) -> "Genome":
+        """Return a child genome with Gaussian noise applied to genes and NN weights."""
         m = self._mutability
-        noise = np.random.normal(0.0, m, GENE_COUNT)
-        child_genes = np.clip(self.genes + noise, 0.0, 1.0)
-        return Genome(child_genes)
+        child_genes = np.clip(self.genes + np.random.normal(0.0, m, GENE_COUNT), 0.0, 1.0)
+        if preserve_diet:
+            child_genes[G_DIET] = self.genes[G_DIET]
+        return Genome(
+            child_genes,
+            self.w1 + np.random.normal(0.0, m, self.w1.shape),
+            self.b1 + np.random.normal(0.0, m, self.b1.shape),
+            self.w2 + np.random.normal(0.0, m, self.w2.shape),
+            self.b2 + np.random.normal(0.0, m, self.b2.shape),
+        )

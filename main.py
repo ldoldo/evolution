@@ -52,9 +52,13 @@ def main() -> None:
 
     # Replay / end-game state
     snapshots:  list  = []
-    replay_idx: int | None = None
+    replay_idx = None
     next_snap   = SNAPSHOT_EVERY
     game_over   = False
+
+    # Extinction auto-restart
+    extinction_count     = 0     # how many auto-restarts have happened this session
+    extinction_triggered = False # reset each restart; prevents re-firing every tick
 
     while True:
         raw_dt = clock.tick(FPS) / 1000.0
@@ -71,14 +75,15 @@ def main() -> None:
                     _quit()
 
                 elif k == pygame.K_r:
-                    sim        = Simulation()
-                    renderer   = Renderer(screen)
-                    selected   = None
-                    snapshots  = []
-                    replay_idx = None
-                    next_snap  = SNAPSHOT_EVERY
-                    game_over  = False
-                    paused     = False
+                    sim              = Simulation()
+                    selected         = None
+                    snapshots        = []
+                    replay_idx       = None
+                    next_snap        = SNAPSHOT_EVERY
+                    game_over        = False
+                    paused           = False
+                    extinction_count     = 0   # manual reset clears the counter
+                    extinction_triggered = False
 
                 elif k == pygame.K_e and not game_over:
                     game_over = True
@@ -145,12 +150,53 @@ def main() -> None:
 
         # Advance simulation
         if not paused and not game_over:
+            pre_herb = sim.herbivore_count
+            pre_carn = sim.carnivore_count
             sub_dt = dt / speedup
             for _ in range(speedup):
                 sim.update(sub_dt)
             # Clear selection if the tracked entity died this tick
             if selected is not None and not selected.alive:
                 selected = None
+
+            # Extinction auto-restart: when a diet class is gone after the grace period.
+            # Use a once-triggered flag so we don't re-fire every tick while the
+            # type is at 0 (the pre→post transition check misses extinctions that
+            # happened during the grace window).
+            if sim.time > 15.0 and not extinction_triggered:
+                herb_gone = sim.herbivore_count == 0
+                carn_gone = sim.carnivore_count == 0
+                if herb_gone or carn_gone:
+                    extinction_triggered = True   # won't re-trigger until next restart
+                    import random as _rnd
+                    survivors = [e.genome for e in sim.entities]
+                    src_pool  = survivors or None
+                    def _src():
+                        return _rnd.choice(src_pool) if src_pool else None
+                    # Typed seeds FIRST — guaranteed slots before INITIAL_POPULATION cap.
+                    # No extra .mutate() here; _init_population already mutates each seed once.
+                    typed_seeds = []
+                    if herb_gone:
+                        typed_seeds.extend(g.mutate(preserve_diet=True) for g in sim._last_herb_genomes[-10:])
+                        typed_seeds.extend(
+                            Simulation.random_typed_genome(0.0, 0.25, _src())
+                            for _ in range(10)
+                        )
+                    if carn_gone:
+                        typed_seeds.extend(g.mutate(preserve_diet=True) for g in sim._last_carn_genomes[-10:])
+                        typed_seeds.extend(
+                            Simulation.random_typed_genome(0.75, 1.0, _src())
+                            for _ in range(10)
+                        )
+                    _rnd.shuffle(survivors)
+                    seeds = typed_seeds + survivors
+                    extinction_count    += 1
+                    extinction_triggered = False   # reset for the new sim
+                    sim                  = Simulation(seed_genomes=seeds)
+                    selected   = None
+                    snapshots  = []
+                    replay_idx = None
+                    next_snap  = SNAPSHOT_EVERY
 
         # Render
         if game_over:
@@ -160,12 +206,14 @@ def main() -> None:
                 snapshots[replay_idx],
                 speedup=speedup, paused=True, selected=None,
                 replay_idx=replay_idx, total_snaps=len(snapshots),
+                extinction_count=extinction_count,
             )
         else:
             renderer.render(
                 sim,
                 speedup=speedup, paused=paused, selected=selected,
                 replay_idx=None, total_snaps=len(snapshots),
+                extinction_count=extinction_count,
             )
 
         pygame.display.flip()

@@ -39,15 +39,15 @@ ENTITY_RADIUS_MULT = 7.0    # visual/collision radius = size * this
 BASE_METABOLISM      = 0.28
 SIZE_COST            = 0.15   # × size²
 MOVE_COST            = 0.12   # × normalised_speed × size   (only when moving)
-DIET_METABOLISM_EXTRA = 0.08  # extra energy/s at diet=1.0; scales linearly with diet
+DIET_METABOLISM_EXTRA = 0.05  # extra energy/s at diet=1.0; scales linearly with diet
 
 # ── Combat ────────────────────────────────────────────────────────────────────
-BASE_ATTACK_DMG         = 14.0
-ATTACK_RANGE_EXTRA      = 8.0   # attack range = attacker.radius + target.radius + this
-ATTACK_COOLDOWN         = 1.2   # seconds between attacks
+BASE_ATTACK_DMG         = 10.0
+ATTACK_RANGE_EXTRA      = 9.0   # attack range = attacker.radius + target.radius + this
+ATTACK_COOLDOWN         = 1.4   # seconds between attacks
 MIN_AGGRESSION_TO_ATTACK = 0.25  # aggression gate; below this the entity won't attack
-ATTACK_ENERGY_COST      = 2.0   # energy (stamina) spent per strike regardless of outcome
-HP_PER_SIZE             = 40.0  # max HP = size * this; combat damage reduces HP, not energy
+ATTACK_ENERGY_COST      = 3.5   # energy (stamina) spent per strike regardless of outcome
+HP_PER_SIZE             = 55.0  # max HP = size * this; combat damage reduces HP, not energy
 HP_REGEN_RATE           = 0.03  # fraction of effective_max_hp recovered per second
 PACK_BONUS_PER_KIN  = 0.20  # +20% damage per kin supporting the attack
 PACK_BONUS_RANGE    = 90.0  # px radius counted as "supporting range"
@@ -58,7 +58,17 @@ HERD_RETALIATION_PER_KIN = 0.30  # +30% retaliation damage per kin near the defe
 
 # ── Corpse ────────────────────────────────────────────────────────────────────
 CORPSE_DECAY       = 28.0   # seconds until full decay
-CORPSE_BITE        = 18.0   # max energy extracted per tick per entity
+CORPSE_BITE        = 26.0   # max energy extracted per tick per entity
+
+# ── Plant stomach (carnivore plant-eating cap) ────────────────────────────────
+# cap (items) = (1−diet)² × PLANT_STOMACH_MAX
+# Tracking item count (not energy) ensures herbivores have proportionally more capacity:
+#   diet=0.00 → 20 plants before full  (effectively unlimited)
+#   diet=0.50 →  5 plants before full
+#   diet=0.75 →  1 plant  before full
+#   diet>0.80 → blocked entirely by the eff<0.04 gate
+PLANT_STOMACH_MAX   = 20    # max plant items a pure herbivore can hold
+PLANT_STOMACH_DECAY = 0.05  # items / second cleared (1 plant digests in ~20 s)
 
 # ── Reproduction ──────────────────────────────────────────────────────────────
 SPAWN_SCATTER = 25.0        # max pixel offset from parent
@@ -73,6 +83,13 @@ FLOCK_IDEAL_DIST = 55.0     # preferred px separation within a flock
 GESTATION_DURATION = 15.0   # seconds from conception to birth
 BIRTH_GROWTH       = 0.25   # newborns start at this fraction of adult size/HP
 GROWTH_RATE        = 0.018  # adult-size fraction per second (~56s to reach 1.0)
+
+# ── Neural-network brain ──────────────────────────────────────────────────────
+# Input : hunger, hp_frac, diet  +  (cos, sin, dist_norm) × 5 targets
+#         targets: nearest food · corpse · threat · prey · kin
+NN_INPUT  = 18
+NN_HIDDEN = 8
+NN_OUTPUT = 3   # move_dx, move_dy, attack_signal  (all tanh → [-1, 1])
 
 # ── Stats graph ───────────────────────────────────────────────────────────────
 POP_HISTORY_LEN    = 400

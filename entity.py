@@ -1,23 +1,21 @@
 from __future__ import annotations
 
 import math
-import random
 import numpy as np
-
-_TWO_PI = math.pi * 2
 
 from genome import Genome
 from food import Food, Corpse
 from config import (
     BASE_METABOLISM, SIZE_COST, MOVE_COST, DIET_METABOLISM_EXTRA,
-    ATTACK_RANGE_EXTRA, ATTACK_COOLDOWN,
-    MIN_AGGRESSION_TO_ATTACK, ATTACK_ENERGY_COST,
+    ATTACK_RANGE_EXTRA, ATTACK_COOLDOWN, ATTACK_ENERGY_COST,
     SPAWN_SCATTER, MIN_PARENT_ENERGY_FRAC, BIRTH_COOLDOWN,
-    KIN_THRESHOLD, FLOCK_IDEAL_DIST,
+    KIN_THRESHOLD,
     GESTATION_DURATION, BIRTH_GROWTH, GROWTH_RATE,
     PACK_BONUS_PER_KIN, PACK_BONUS_RANGE, MAX_PACK_BONUS,
-    PACK_FLEE_PER_KIN, PACK_DEFENSE_PER_KIN, HERD_RETALIATION_PER_KIN,
+    PACK_DEFENSE_PER_KIN, HERD_RETALIATION_PER_KIN,
     HP_REGEN_RATE,
+    PLANT_STOMACH_MAX, PLANT_STOMACH_DECAY,
+    NN_INPUT,
 )
 
 
@@ -68,12 +66,12 @@ class Entity:
         self._growth:           float = 1.0   # 1.0 = fully grown adult
         self._gestation_timer:  float = 0.0
         self._pending_offspring: list[tuple[Genome, float]] = []
-        # Per-tick FOV cache — set once in update() before _compute_desired
-        self._cached_spd:      float = 0.0
-        self._cached_heading:  float = 0.0
-        self._cached_vis_half: float = math.pi   # default: omnivision
-        # Per-tick kin cache — computed once in update(), shared by steering + combat
+        # Per-tick NN output — set in update(), consumed by simulation for attack gate
+        self._nn_attack: float = 0.0
+        # Per-tick kin cache — computed once in update(), shared by brain + combat
         self._kin_cache: dict[int, bool] = {}
+        # Plant stomach: tracks recent plant-energy intake; carnivores fill up fast
+        self._plant_stomach: float = 0.0
 
     # ── Derived runtime phenotype ──────────────────────────────────────────────
 
@@ -87,17 +85,6 @@ class Entity:
         """HP ceiling scales with body size during growth."""
         return self.genome.max_hp * self._growth
 
-    # ── Kin recognition ───────────────────────────────────────────────────────
-
-    def _kin_similarity(self, other: "Entity") -> float:
-        """
-        Gene-space similarity in [0, 1].
-        Formula: 1 − mean(|g_self − g_other|)
-        Random pairs average ≈ 0.67.  Parent/offspring ≈ 0.96.
-        KIN_THRESHOLD = 0.80 cleanly separates family from strangers.
-        """
-        return float(1.0 - np.mean(np.abs(self.genome.genes - other.genome.genes)))
-
     # ── Metabolism ────────────────────────────────────────────────────────────
 
     def _metabolic_cost(self, dt: float) -> float:
@@ -109,168 +96,111 @@ class Entity:
                     + eff_size ** 2 * SIZE_COST + norm * eff_size * MOVE_COST)
         return cost * dt
 
-    # ── Field of view ─────────────────────────────────────────────────────────
+    # ── Neural-network brain ──────────────────────────────────────────────────
 
-    def _in_fov(self, tx: float, ty: float) -> tuple[bool, float]:
-        """Return (visible, distance).  Uses cached heading + half-angle.
-
-        Callers are expected to pre-filter by vision_range via _nearby(), so
-        that check is omitted here.  Cache fields (_cached_spd, _cached_heading,
-        _cached_vis_half) must be refreshed each tick before calling this.
-        """
-        dx   = tx - self.x
-        dy   = ty - self.y
-        dist = math.hypot(dx, dy)
-        half = self._cached_vis_half
-        if half >= math.pi:               # 360-degree vision — common fast path
-            return True, dist
-        if self._cached_spd < 1.0:        # stationary → omnidirectional
-            return True, dist
-        to_tgt = math.atan2(dy, dx)
-        diff   = abs(math.atan2(math.sin(to_tgt - self._cached_heading),
-                                math.cos(to_tgt - self._cached_heading)))
-        return diff <= half, dist
-
-    # ── Steering ──────────────────────────────────────────────────────────────
-
-    def _compute_desired(
+    def _build_obs(
         self,
         food_items: list[Food],
         entities: list["Entity"],
         corpses: list[Corpse],
-    ) -> tuple[float, float]:
+    ) -> np.ndarray:
         """
-        Weighted-force steering.  Returns an un-normalised desired direction.
+        Build the 18-element observation vector fed to the NN each tick.
 
-        Forces:
-          • Seek plants      — weighted by plant_efficiency × hunger
-          • Seek corpses     — weighted by meat_efficiency × hunger
-          • Flock with kin   — cohesion when far, separation when close (if social)
-          • Chase prey       — weighted by meat_efficiency × aggression × hunger (skips kin if social)
-          • Flee predators   — weighted by (1-aggression)
-          • Wander noise     — small constant
+        Layout (indices):
+          0  hunger          — 1 − energy/threshold  (0=full, 1=starving)
+          1  hp_frac         — hp / effective_max_hp
+          2  diet            — genome diet gene  (0=herb, 1=carn)
+          3,4  food_cos/sin  — unit direction to nearest visible plant
+          5    food_dist     — 1 − dist/vision_range  (1=adjacent, 0=edge)
+          6,7  corpse_cos/sin
+          8    corpse_dist
+          9,10 threat_cos/sin — nearest entity that is a predator to this one
+          11   threat_dist
+          12,13 prey_cos/sin  — nearest entity this one could hunt
+          14    prey_dist
+          15,16 kin_cos/sin   — nearest genetic kin
+          17    kin_dist
+        All direction components are 0 if no such object is visible.
         """
-        g        = self.genome
-        diet     = g.diet
-        aggress  = g.aggression
-        hunger   = 1.0 - min(self.energy / g.reproduce_threshold, 1.0)
-        plant_w  = g.plant_efficiency    # (1-diet)² — zero for pure carnivores
-        meat_w   = g.meat_efficiency     # diet²     — zero for pure herbivores
+        obs = np.zeros(NN_INPUT)
+        g   = self.genome
+        sx, sy = self.x, self.y
+        vis    = g.vision_range
 
-        dx = dy = 0.0
+        obs[0] = 1.0 - min(self.energy / g.reproduce_threshold, 1.0)
+        obs[1] = self.hp / max(self.effective_max_hp, 1.0)
+        obs[2] = g.diet
 
-        sx = self.x
-        sy = self.y
+        # ── Nearest food ──────────────────────────────────────────────────────
+        best = vis + 1.0; bdx = bdy = 0.0
+        for f in food_items:
+            dx = f.x - sx; dy = f.y - sy
+            d  = math.hypot(dx, dy)
+            if 0 < d < best:
+                best = d; bdx = dx / d; bdy = dy / d
+        if best <= vis:
+            obs[3] = bdx; obs[4] = bdy
+            obs[5] = 1.0 - best / vis
 
-        # ── Seek plants ───────────────────────────────────────────────────────
-        # Food items are already filtered to vision_range by _nearby; no FOV
-        # angle check needed (smell/sense is omnidirectional).
-        herb_w = plant_w * hunger * 2.8
-        if herb_w > 0.02:
-            for f in food_items:
-                fdx = f.x - sx
-                fdy = f.y - sy
-                dist = math.hypot(fdx, fdy)
-                if dist > 0:
-                    w  = herb_w / (dist + 1.0)
-                    dx += fdx / dist * w
-                    dy += fdy / dist * w
+        # ── Nearest corpse ────────────────────────────────────────────────────
+        best = vis + 1.0; bdx = bdy = 0.0
+        for c in corpses:
+            dx = c.x - sx; dy = c.y - sy
+            d  = math.hypot(dx, dy)
+            if 0 < d < best:
+                best = d; bdx = dx / d; bdy = dy / d
+        if best <= vis:
+            obs[6] = bdx; obs[7] = bdy
+            obs[8] = 1.0 - best / vis
 
-        # ── Seek corpses ──────────────────────────────────────────────────────
-        corp_w = meat_w * hunger * 2.2
-        if corp_w > 0.02:
-            for c in corpses:
-                cdx = c.x - sx
-                cdy = c.y - sy
-                dist = math.hypot(cdx, cdy)
-                if dist > 0:
-                    w  = corp_w / (dist + 1.0)
-                    dx += cdx / dist * w
-                    dy += cdy / dist * w
+        # ── Nearest threat / prey / kin from entity list ──────────────────────
+        self_diet     = g.diet
+        self_eff_size = g.size * self._growth
+        kin           = self._kin_cache
 
-        # ── Interactions with other entities ──────────────────────────────────
-        soc       = g.sociality
-        flock_w   = soc * 2.0
-        # Avoidance strength: peaks at 1.0 for soc=0, zero at soc=0.5
-        avoid_str = max(0.0, (0.5 - soc) * 2.0)
+        bt = bp = bk = vis + 1.0
+        tdx = tdy = pdx = pdy = kdx = kdy = 0.0
 
-        # Kin dict pre-computed once in update() and cached on self._kin_cache
-        kin = self._kin_cache
-        # Count visible kin for pack-flee bonus (0 when cache empty / loner)
-        kin_count = sum(1 for v in kin.values() if v)
-
-        self_size = g.size * self._growth   # effective body size (shrinks while juvenile)
-        vis_half  = self._cached_vis_half          # cache outside loop
-        limited_fov = vis_half < math.pi and self._cached_spd >= 1.0
-
-        for other in entities:
-            if other.id == self.id:
+        for e in entities:
+            if e.id == self.id:
                 continue
-            # Inline _in_fov: avoids function-call overhead and reuses _dx/_dy below
-            _dx  = other.x - sx
-            _dy  = other.y - sy
-            dist = math.hypot(_dx, _dy)
-            if dist <= 0:
+            dx = e.x - sx; dy = e.y - sy
+            d  = math.hypot(dx, dy)
+            if d <= 0:
                 continue
-            if limited_fov:
-                to_tgt = math.atan2(_dy, _dx)
-                diff   = abs(math.atan2(math.sin(to_tgt - self._cached_heading),
-                                        math.cos(to_tgt - self._cached_heading)))
-                if diff > vis_half:
-                    continue
+            ndx = dx / d; ndy = dy / d
 
-            ox = _dx / dist
-            oy = _dy / dist
+            other_diet     = e.genome.diet
+            other_eff_size = e.genome.size * e._growth
 
-            is_kin = kin.get(other.id, False)
+            # Is e a threat to me?
+            if (other_diet - self_diet > 0.15
+                    and other_eff_size / max(self_eff_size, 0.01) >= 0.6
+                    and d < bt):
+                bt = d; tdx = ndx; tdy = ndy
 
-            # Am I a meaningful predator to this entity?  (needed before avoid)
-            other_diet = other.genome.diet
-            other_size = other.genome.size * other._growth
-            diet_advantage = diet - other_diet
-            size_advantage = self_size / max(other_size, 0.01)
-            is_hunter = diet_advantage > 0.15 and size_advantage >= 0.6
+            # Is e prey for me?
+            if (self_diet - other_diet > 0.15
+                    and self_eff_size / max(other_eff_size, 0.01) >= 0.6
+                    and d < bp):
+                bp = d; pdx = ndx; pdy = ndy
 
-            # Is it a meaningful threat to me?
-            their_diet_adv = other_diet - diet
-            their_size_adv = other_size / max(self_size, 0.01)
-            is_threat = their_diet_adv > 0.15 and their_size_adv >= 0.6
+            # Is e kin?
+            if kin.get(e.id, False) and d < bk:
+                bk = d; kdx = ndx; kdy = ndy
 
-            # ── Sociality-driven spatial forces ───────────────────────────────
-            if soc > 0.5 and is_kin:
-                # Flock: cohesion when far, gentle separation when close
-                if dist > FLOCK_IDEAL_DIST:
-                    w = flock_w / (dist + 1.0)
-                    dx += ox * w
-                    dy += oy * w
-                else:
-                    w = flock_w * 1.5 / (dist + 0.5)
-                    dx -= ox * w
-                    dy -= oy * w
-            elif avoid_str > 0.0 and not is_kin and not is_hunter:
-                # Loners repel non-kin — but don't avoid prey they're hunting
-                w = avoid_str * 1.6 / (dist + 0.5)
-                dx -= ox * w
-                dy -= oy * w
+        if bt <= vis:
+            obs[9]  = tdx; obs[10] = tdy
+            obs[11] = 1.0 - bt / vis
+        if bp <= vis:
+            obs[12] = pdx; obs[13] = pdy
+            obs[14] = 1.0 - bp / vis
+        if bk <= vis:
+            obs[15] = kdx; obs[16] = kdy
+            obs[17] = 1.0 - bk / vis
 
-            if is_hunter and aggress > 0.25:
-                # Kin-protective entities don't chase kin
-                if not (is_kin and g.kin_protection > 0.3):
-                    chase_w = meat_w * aggress * hunger * 2.0 / (dist + 1.0)
-                    dx += ox * chase_w
-                    dy += oy * chase_w
-            elif is_threat:
-                pack_flee = 1.0 + PACK_FLEE_PER_KIN * min(kin_count, MAX_PACK_BONUS)
-                flee_w = (1.0 - aggress) * 3.5 * pack_flee / (dist + 1.0)
-                dx -= ox * flee_w
-                dy -= oy * flee_w
-
-        # ── Wander noise ──────────────────────────────────────────────────────
-        angle = random.random() * _TWO_PI
-        dx += math.cos(angle) * 0.14
-        dy += math.sin(angle) * 0.14
-
-        return dx, dy
+        return obs
 
     # ── Per-tick update ───────────────────────────────────────────────────────
 
@@ -289,6 +219,7 @@ class Entity:
         self.age      += dt
         self._atk_cd   = max(0.0, self._atk_cd  - dt)
         self._birth_cd = max(0.0, self._birth_cd - dt)
+        self._plant_stomach = max(0.0, self._plant_stomach - PLANT_STOMACH_DECAY * dt)
 
         # ── Growth ────────────────────────────────────────────────────────────
         if self._growth < 1.0:
@@ -307,30 +238,33 @@ class Entity:
         if self.hp < max_hp:
             self.hp = min(self.hp + max_hp * HP_REGEN_RATE * dt, max_hp)
 
-        # ── FOV geometry cache ────────────────────────────────────────────────
-        # Refreshed here so _in_fov() never recomputes these per-call.
-        self._cached_spd     = math.hypot(self.vx, self.vy)
-        self._cached_heading = (math.atan2(self.vy, self.vx)
-                                if self._cached_spd >= 1.0 else 0.0)
-        self._cached_vis_half = self.genome.vision_half_angle
-
         # ── Kin cache ─────────────────────────────────────────────────────────
-        # Computed once per tick; read by _compute_desired() and attack() so
-        # the numpy array construction and mean() run only once per entity.
+        # Always computed — needed by both _build_obs() and attack().
         self._kin_cache = {}
-        if entities and (self.genome.sociality > 0.05 or self.genome.kin_protection > 0.05):
+        if entities:
             sg  = self.genome.genes
-            og  = np.array([e.genome.genes for e in entities])   # (n, 12)
-            sim = 1.0 - np.abs(sg - og).mean(axis=1)             # (n,)
+            og  = np.array([e.genome.genes for e in entities])
+            sim = 1.0 - np.abs(sg - og).mean(axis=1)
             for e, s in zip(entities, sim):
                 self._kin_cache[e.id] = bool(s >= KIN_THRESHOLD)
 
-        # ── Steering ─────────────────────────────────────────────────────────
-        ddx, ddy = self._compute_desired(food_items, entities, corpses)
+        # ── Brain: build observation → NN forward pass ────────────────────────
+        obs = self._build_obs(food_items, entities, corpses)
+        out = self.genome.forward(obs)          # (move_dx, move_dy, attack_signal)
+        self._nn_attack = float(out[2])
+
+        ddx, ddy = float(out[0]), float(out[1])
+        # NN magnitude is meaningful: near-zero → rest, large → full speed.
+        # Clamp to unit circle so max_spd stays the true ceiling.
         mag = math.hypot(ddx, ddy)
-        if mag > 0:
+        if mag > 1.0:
             ddx /= mag
             ddy /= mag
+        # Wander noise only when the NN is near-idle (nothing worth moving toward),
+        # so entities don't freeze permanently but can still choose to rest.
+        elif mag < 0.15:
+            ddx += np.random.randn() * 0.12
+            ddy += np.random.randn() * 0.12
 
         max_spd = self.genome.max_speed
         accel   = 9.0
@@ -355,17 +289,28 @@ class Entity:
 
     def eat_food(self, food_items: list[Food]) -> list[Food]:
         """
-        Consume any plant within reach.
+        Consume any plant within reach, subject to the plant stomach cap.
+
+        The stomach tracks item count (not energy), so the cap in items is the
+        same formula regardless of how much energy each plant provides:
+          cap = (1−diet)² × PLANT_STOMACH_MAX
+        This gives herbivores a large item budget; high-diet entities fill up
+        after 1-2 plants and must wait ~20 s per plant to digest before eating more.
         Returns the list of Food objects that were eaten (to be removed).
         """
         eaten: list[Food] = []
-        reach = self.effective_radius + 6.0
-        eff   = self.genome.plant_efficiency
-        if eff < 0.001:
+        g   = self.genome
+        eff = g.plant_efficiency
+        if eff < 0.04:          # diet > ~0.8 → can't digest plants meaningfully
             return eaten
+        cap   = (1.0 - g.diet) ** 2 * PLANT_STOMACH_MAX
+        reach = self.effective_radius + 6.0
         for f in food_items:
+            if self._plant_stomach >= cap:
+                break           # stomach full — leave remaining plants for others
             if math.hypot(f.x - self.x, f.y - self.y) <= reach:
-                self.energy += f.energy * eff
+                self._plant_stomach += 1.0      # count items, not energy
+                self.energy         += f.energy * eff
                 eaten.append(f)
         return eaten
 
@@ -425,9 +370,6 @@ class Entity:
             return []
 
         g = self.genome
-        if g.aggression < MIN_AGGRESSION_TO_ATTACK:
-            return []
-
         skip_kin  = g.kin_protection > 0.3   # won't attack genetic kin
         is_social = g.sociality > 0.3        # coordinates pack hunts
 
